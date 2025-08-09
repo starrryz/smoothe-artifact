@@ -30,7 +30,7 @@ def get_args(default=False):
                         default='examples/cunxi_test_egraph2.dot')
     parser.add_argument('--num_steps', type=int, default=100)
     parser.add_argument('--patience', type=int, default=20)
-    parser.add_argument('--time_limit', type=int, default=60)
+    parser.add_argument('--time_limit', type=int, default=1200)
     parser.add_argument('--random_seed', type=int, default=44)
     parser.add_argument('--batch_size', type=int, default=None)
     parser.add_argument('--hidden_dim', type=int, default=32)

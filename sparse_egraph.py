@@ -170,7 +170,7 @@ class SparseEGraph(BaseEGraph):
                                            requires_grad=False)
         self.batch_per_node = torch.repeat_interleave(
             torch.arange(B, device=self.device), N)
-        self.node_per_node = torch.arange(N, device=self.device).repeat(B)
+        self.node_per_node = self.class2node.storage._col.clone().repeat(B)
 
         self.index0 = nn.Parameter(self.batch_per_node * M +
                                    self.class_per_node,
@@ -852,9 +852,14 @@ class SparseEGraph(BaseEGraph):
                     else:
                         value = values[edge_mask]
 
-                    scc = torch.sparse_coo_tensor(reverse_index, value,
-                                                  (degree, degree))
-                    expm = sparse_expm(scc)
+                    if degree == 2:
+                        # Reference: https://chatgpt.com/share/67e43b4c-b594-8012-bab7-b1c3a39a6f90
+                        expm = 2 * torch.cosh(value[0] * value[1]) - 2
+                    else:
+                        scc = torch.sparse_coo_tensor(reverse_index, value,
+                                                      (degree, degree))
+                        expm = sparse_expm(scc)
+
                     if degree > 5000:
                         expm *= 1e-2
                     cyclic_loss += expm
