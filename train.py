@@ -30,7 +30,7 @@ def get_args(default=False):
                         default='examples/cunxi_test_egraph2.dot')
     parser.add_argument('--num_steps', type=int, default=100)
     parser.add_argument('--patience', type=int, default=20)
-    parser.add_argument('--time_limit', type=int, default=1200)
+    parser.add_argument('--time_limit', type=int, default=60)
     parser.add_argument('--random_seed', type=int, default=44)
     parser.add_argument('--batch_size', type=int, default=None)
     parser.add_argument('--hidden_dim', type=int, default=32)
@@ -84,6 +84,7 @@ def sample(egraph, verbose=False, cycle_info=False):
         cur_egraph = egraph
 
     with torch.no_grad():
+        # 关键在于这里，用的是forward的hard_sample
         enodes = cur_egraph(cur_egraph.embedding, hard=True)
         loss = cur_egraph.compute_loss(enodes,
                                        verbose=verbose,
@@ -143,12 +144,16 @@ def run(args):
                           greedy_ini=args.greedy_ini,
                           assumtion=args.assumption)
     if args.gpus >= 1:
+        # pytorch的.cuda，目的是将参数和buffer真正搬到GPU上
         egraph = egraph.cuda()
+    # 这个temprature和前面加随机数再除以τ可能有关，控制训练步数
     egraph.set_temperature_schedule(args.num_steps)
     egraph.reg = args.regularizer
     if args.quad_cost:
+        # 二次型成本矩阵
         egraph.init_quad_cost(args.quad_cost)
     if args.mlp_cost:
+        # mlp网络
         egraph.init_mlp_cost(args.mlp_cost)
 
     lr = args.base_lr
@@ -197,6 +202,7 @@ def run(args):
 
     training_log = defaultdict(list)
     logging.info(f'cost per node {egraph.cost_per_node}')
+    # 不再下降就提前结束训练
     early_stop = EarlyStopper(patience=args.patience)
 
     if args.debug:
@@ -215,6 +221,8 @@ def run(args):
         for_loop = range(args.num_steps)
     probs = []
     for step in for_loop:
+        # 先来一遍得到推理损失，用来监控收敛，sample -> eval -> forward(hard) -> compute loss -> train -> return loss
+        # 我觉得可以用原本的替代
         inf_loss = sample(egraph, cycle_info=args.cycle_info)
         training_log['sample_time'].append(time.time() - start_time)
         # if step == args.num_steps // 2:
@@ -223,14 +231,19 @@ def run(args):
         # hard = True if step > args.num_steps // 2 else False
         # optim_goal = 'depth' if args.depth else 'sum'
 
+        # 是不是egraph直接调用forward，今天刚搜到的
+        # 然后forward调用samplev2，samplev2调用cyclic loss
         enodes, cyclic_loss = egraph(cur_egraph.embedding, hard=False)
         training_log['forward_time'].append(time.time() - start_time)
+        # 计算整体的loss
         loss = cur_egraph.compute_loss(enodes, cyclic_loss)
-        probs.append(egraph.probs_class2node)
+        probs.append(egraph.probs_class2node) 
+
+        # 反向传播计算梯度，更新梯度，归零梯度，防止累加
         loss.backward()
         # max_emb_grad = torch.max(torch.abs(cur_egraph.embedding.grad))
         optimizer.step()
-        # scheduler.step()
+        # scheduler.step() 归零梯度防止累加
         optimizer.zero_grad()
 
         if not args.random:
@@ -239,6 +252,8 @@ def run(args):
         training_log['inference_loss'].append(inf_loss.item())
         training_log['loss'].append(loss.item())
         training_log['time'].append(time.time() - start_time)
+
+        # 达到时间上限，或者early_stop，就停止
         if time.time() - start_time > args.time_limit:
             logging.info('time limit reached')
             break
@@ -254,12 +269,40 @@ def run(args):
     logging.info(f'finished optimization, now sampling')
     loss = sample(egraph, verbose=args.verbose, cycle_info=True)
 
+    # 输出最优选择节点的新代码
+    try:
+        cur_egraph.eval()
+        with torch.no_grad():
+            # 1) 做一次离散推理，拿到 [B, N] 的选中 mask
+            visited = cur_egraph.inference_sample(cur_egraph.embedding)
+
+            # 2) 计算每个 batch 的线性代价，取最优批
+            visited_float = visited.to(device=cur_egraph.nodes2raw.device, dtype=cur_egraph.nodes2raw.dtype)  # ←★ 关键
+            raw_enodes = visited_float @ cur_egraph.nodes2raw                  # [B, N_raw]
+            batch_cost = cur_egraph.linear_cost(raw_enodes)  
+            best_b = int(batch_cost.argmin().item())
+
+            # 3) 组织元信息
+            meta = {
+                "best_batch_cost": float(batch_cost[best_b]),
+                "best_iter": int(np.argmin(training_log["inference_loss"])) if len(training_log["inference_loss"]) else None,
+                "best_inference_loss": float(np.min(training_log["inference_loss"])) if len(training_log["inference_loss"]) else None,
+            }
+
+            # 4) 输出到 logs/smoothe_log/*_selection.json
+            stem = os.path.splitext(os.path.basename(args.input_file))[0].replace("_dump", "")
+            out_path = os.path.join("logs", "smoothe_log", f"{stem}_selection.json")
+            cur_egraph.dump_selection(visited, out_path, batch=best_b, meta=meta)  # ← 仍传 bool
+            logging.info(f"selection dumped to {out_path}")
+    except Exception as ex:
+        logging.warning(f"dump_selection failed: {ex}")
+
     training_log['time'].append(time.time() - start_time)
     training_log['loss'].append(loss.item())
 
     logging.info(f'training log: {training_log}')
     file_name = os.path.splitext(os.path.basename(
-        args.input_file))[0] + '_smoothe'
+        args.input_file))[0].replace("_dump", "") + '_smoothe'
     file_name += '_depth' if args.depth else ''
     json.dump(training_log, open(f'logs/smoothe_log/{file_name}.json', 'w'))
     logging.info('logs dumped to ' + f'logs/smoothe_log/{file_name}.json')

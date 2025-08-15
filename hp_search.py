@@ -2,11 +2,22 @@ import subprocess as sp
 import argparse
 import os
 import torch
+import traceback
 import numpy as np
 from train import run
 from train import get_args as get_train_args
 
+def dump_args(ns, tag="ARGS"):
+    try:
+        import os
+        kv = {k: getattr(ns, k) for k in vars(ns)}
+        print(f"[{tag}] " + " ".join(f"{k}={repr(v)}" for k, v in sorted(kv.items())), flush=True)
+        if hasattr(ns, "input_file"):
+            print(f"[{tag}] input_file={ns.input_file} exists? {os.path.exists(ns.input_file)}", flush=True)
+    except Exception as e:
+        print(f"[{tag}] <failed to dump args: {e}>", flush=True)
 
+# 前面进来一次参数了，为什么这里还要有一遍
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -20,6 +31,8 @@ def get_args():
 
 
 def call_command(args):
+    print("[call_command] enter", flush=True)
+    dump_args(args, tag="call_command")
     try:
         log = run(args)
     except RuntimeError as e:
@@ -37,7 +50,7 @@ def call_command(args):
         # print(f"Caught ValueError: {str(ve)}")
         return None
     except Exception as ex:
-        # print(f"Caught an unexpected exception: {str(ex)}")
+        print(f"Caught an unexpected exception: {str(ex)}")
         return None
     return log
 

@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.log
+*.pt
+*.pth
+*.pkl
+*.onnx
+*.bin
+*.zip
+logs/
+dataset/data_from_nncase/

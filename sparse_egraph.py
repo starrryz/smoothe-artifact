@@ -7,6 +7,8 @@ import os
 import pickle
 import networkx as nx
 import scipy
+from typing import Optional  # 也可加 Dict, Any 如果你想更严格
+import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,7 +27,7 @@ from tqdm import tqdm
 
 spmm = torch_sparse.matmul
 
-
+# dim = 1指的是行，dim = 0指的是列
 def sparse_gumbel_softmax(src,
                           row,
                           col,
@@ -34,8 +36,10 @@ def sparse_gumbel_softmax(src,
                           hard=False,
                           dim=-1,
                           return_format='torch_sparse'):
+                        # torch_sparse.SparseTensor 或者是原生的torch.sparse_coo_tensor
     # Generate Gumbel noise for non-zero elements in logits
     gumbel_noise = -torch.empty_like(src).exponential_().log()
+    # 加上噪声，再除以温度τ，得到扰动后的logits
     perturbed_logits = (src + gumbel_noise) / tau
     # Apply sparse softmax to the perturbed logits
     if dim == 1:
@@ -46,24 +50,27 @@ def sparse_gumbel_softmax(src,
         raise ValueError
 
     # the shape [BM, BN], implicitly reshape it to [BN, BM] here
+    # 构建两个稀疏张量
     if return_format == 'torch_sparse':
         ret = SparseTensor(row=col, col=row, value=y_soft, sparse_sizes=shape)
     elif return_format == 'torch':
         ret = torch.sparse_coo_tensor(indices=torch.stack([col, row]),
                                       values=y_soft,
                                       size=shape)
-
+    # 硬化
     if hard:
         # TODO: fix this branch for torch return_format
         _, row_count = torch.unique_consecutive(row, return_counts=True)
         max_per_row = spmax(ret, dim=0)
         max_per_col = torch.repeat_interleave(max_per_row, row_count)
+        # 标记组内最大位置
         max_mask = (y_soft == max_per_col)
         hard_ret = SparseTensor(row=col[max_mask],
                                 col=row[max_mask],
                                 value=torch.ones(max_mask.sum(),
                                                  device=src.device),
                                 sparse_sizes=shape)
+        # 做梯度直通然后合成
         neg_ret = SparseTensor(row=col,
                                col=row,
                                value=-y_soft,
@@ -71,7 +78,9 @@ def sparse_gumbel_softmax(src,
         ret = hard_ret + neg_ret.detach() + ret
     return ret
 
-
+# row 是 class -> node
+# col 是 node -> class 都是表示联系关系矩阵
+# dim 可能标志的是入 或者 出
 def sparse_softmax(src, row, col, shape, dim=-1):
     if dim == 1:
         y_soft = softmax(src.flatten(), index=row)
@@ -82,7 +91,7 @@ def sparse_softmax(src, row, col, shape, dim=-1):
     ret = SparseTensor(row=col, col=row, value=y_soft, sparse_sizes=shape)
     return ret
 
-
+# 可能是起到归一化的作用？
 def sparse_normalize(src, row, col, shape, dim=-1):
     src = torch.sigmoid(src.flatten())
 
@@ -158,6 +167,26 @@ class SparseEGraph(BaseEGraph):
         self.cyclic_count = 0
         self.set_index()
         self.known_cycles = []
+    @torch.no_grad()
+    def decode_selected_keys(self, visited_nodes: torch.Tensor, batch: int = 0):
+        """
+        visited_nodes: [B, N] 的 0/1（或 float）mask，来自 inference_sample 的返回
+        返回：该 batch 选中的 enode 的 key 列表，比如 ["5.0","3.0",...]
+        """
+        mask = visited_nodes[batch].bool()
+        return self.node_to_id(mask)   # 你已有的映射工具，能把 mask → key 列表
+
+    @torch.no_grad()
+    def dump_selection(self, visited_nodes: torch.Tensor, out_path: str, batch: int = 0, meta: Optional[dict] = None):
+        payload = {
+            "batch": int(batch),
+            "extract": self.decode_selected_keys(visited_nodes, batch),
+            "meta": (meta or {})
+        }
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(f"[DUMP] wrote selection to {out_path}")
 
     @torch.no_grad()
     def set_index(self):
@@ -170,7 +199,7 @@ class SparseEGraph(BaseEGraph):
                                            requires_grad=False)
         self.batch_per_node = torch.repeat_interleave(
             torch.arange(B, device=self.device), N)
-        self.node_per_node = self.class2node.storage._col.clone().repeat(B)
+        self.node_per_node = torch.arange(N, device=self.device).repeat(B)
 
         self.index0 = nn.Parameter(self.batch_per_node * M +
                                    self.class_per_node,
@@ -178,7 +207,6 @@ class SparseEGraph(BaseEGraph):
         self.index1 = nn.Parameter(self.batch_per_node * N +
                                    self.node_per_node,
                                    requires_grad=False)
-
     def find_cycles(self, batch_choose_enodes, cycle_info=False):
 
         def cycle_dfs(class_id):
@@ -188,26 +216,35 @@ class SparseEGraph(BaseEGraph):
             if status[class_id] == "Done":
                 return
             elif status[class_id] == "Doing":
+                # first，这种情况是记录整个环的信息，包括class和node
                 if cycle_info:
+                    # 2. 得到第一次重复的class，node对索引，记为i
                     cycle_start_index = stack.index((class_id, node_id))
+                    # 3. 从 i 开始遍历整个stack，得到class为元素的环和node为元素的环
                     class_cycle = [c[0] for c in stack[cycle_start_index:]]
                     node_cycle = [c[1] for c in stack[cycle_start_index:]]
+                    # 两个 cycle list 组成的 pair
                     cycles.append((class_cycle, node_cycle))
+                #  second 这种情况只记录进入环的class_id，或者说环中其中一个节点的信息
                 else:
                     cycles.append(class_id)
                 return
 
             status[class_id] = "Doing"
+            # 1. stack中存放 class 和 node 对，直到找到循环把这些节点放到cycle中
             stack.append((class_id, node_id))
+            # no child teminate dfs
+            # like domino all doing class will be set "done" and no cycle be found 
             for child in child_classes:
                 cycle_dfs(child)
 
             status[class_id] = "Done"
-            stack.pop()
+            stack.pop() # to avoid OOM, cycle info will store at cycles not stack, stack may help debug by monitor the value change
 
         # all use int index for eclass and enode
         batch_cycles = []
         batch_cycle_num = []
+        # 根据之前找到的nodes，将选中的enode情况映射到eclass层面
         for batch in range(self.batch_size):
             enodes = torch.where(batch_choose_enodes[batch])[0].tolist()
             if len(enodes) == 0:
@@ -220,7 +257,7 @@ class SparseEGraph(BaseEGraph):
                 self.enodes[enode].belong_eclass_id: enode
                 for enode in np.atleast_1d(enodes)
             }
-
+            # 做环路检测，输出环数和环的构成
             status = defaultdict(lambda: "Todo")
             cycles = []
             stack = []
@@ -228,6 +265,7 @@ class SparseEGraph(BaseEGraph):
                 cycle_dfs(root)
             batch_cycles.append(cycles)
             batch_cycle_num.append(len(cycles))
+        # 环的数量，每个环的信息(环路，或者入环的节点)
         return batch_cycle_num, batch_cycles
 
     def set_root(self):
@@ -360,14 +398,17 @@ class SparseEGraph(BaseEGraph):
 
     # @profile
     def sample_v2(self, embedding, hard=False):
+        # 单GPU上的batch数，eclass的总数，enode的总数
         B, M, N = self.batch_size // self.gpus, len(self.eclasses), len(
             self.enodes)
         eps = 1e-10
         device = embedding.device
+        # 新建矩阵，存放enode对应的概率值
         node_prob = torch.zeros((B, N), device=device, requires_grad=False)
-
+        # 把每个节点的隐向量映射成标量
         node_logits = self.forward_embedding(embedding)  # [B, N]
 
+        # 每个 class 在该 batch 中对每个 node 的“软”采样概率
         probs_class2node = sparse_gumbel_softmax(node_logits,
                                                  row=self.index0[:B * N],
                                                  col=self.index1[:B * N],
@@ -379,6 +420,7 @@ class SparseEGraph(BaseEGraph):
 
         probs_class2node_clone = probs_class2node.clone()
         self.probs_class2node = probs_class2node
+        # 环路惩罚没看懂
         if self.filter_cycles:
             # reduce the batch dimension on the class dimension
             reshaped_probs_class2node = probs_class2node.clone()
@@ -386,7 +428,7 @@ class SparseEGraph(BaseEGraph):
             reshaped_probs_class2node.storage._sparse_sizes = (B * N, M)
 
             self.compute_cyclic_loss2(reshaped_probs_class2node)
-
+        # 构造批量class -> node, node -> class COO 稀疏矩阵
         row = probs_class2node.storage._row
         col = probs_class2node.storage._col
         values = probs_class2node.storage._value
@@ -400,6 +442,7 @@ class SparseEGraph(BaseEGraph):
         #                                             values=values,
         #                                             size=(B * M, N))
 
+        # 拓展到批量维度
         if not hasattr(self, 'batch_node2class'):
             self.node2class = self.node2class.to(device)
             row = self.node2class.storage._row
@@ -417,6 +460,7 @@ class SparseEGraph(BaseEGraph):
 
         # [BM, BN] @ [BN, BM] -> [BM, BM]
         # c2c = probs_class2node @ self.batch_node2class
+        # (class→node) × (node→class) → (class→class) 求得是class -> node -> class的联合概率 @ 是 矩阵乘 的意思
         c2c = probs_class2node @ self.batch_node2class.to(device)
         # torch.save(probs_class2node, 'c2n.pt')
         # torch.save(self.batch_node2class.to(device), 'n2c.pt')
@@ -427,14 +471,16 @@ class SparseEGraph(BaseEGraph):
         # c2c = probs_class2node2 @ self.node2class.to_torch_sparse_coo_tensor()
         indices = c2c.indices()
         # indices[1] += indices[0] // M * M
-
+        # 迭代求class被激活的总概率，
         class_prob = torch.zeros((B * M), device=device, requires_grad=False)
         max_norm = 0
         for i in range(M):
+            # 只激活源class
             if i == 0:
                 cur_class_prob = self.set_root().float().to(device)
                 cur_class_prob = cur_class_prob.unsqueeze(0).expand(
                     B, M).flatten()
+            # 任意已激活的class到新class
             else:
                 # # [B, M] -> [BM, 1]
                 # class_prob = class_prob.flatten()
@@ -463,6 +509,7 @@ class SparseEGraph(BaseEGraph):
                                                                     B * M))
                     ind_cur_class_prob = ind_cur_class_prob.sum(dim=0)
                     ind_cur_class_prob = ind_cur_class_prob.to_dense()
+                    # 1−∏(1−p)，还是之前的，至少有一个父节点选中的概率
                     ind_cur_class_prob = 1 - torch.exp(ind_cur_class_prob)
 
                 if self.assumption == 'neg_correlated':
@@ -473,22 +520,24 @@ class SparseEGraph(BaseEGraph):
                                                                     B * M))
                     cor_cur_class_prob = cor_cur_class_prob.sum(dim=0)
 
-                if self.assumption == 'correlated':
+                if self.assumption == 'correlated': # 这个取得是max
                     cur_class_prob = cor_cur_class_prob.to_dense()
-                elif self.assumption == 'independent':
+                elif self.assumption == 'independent': 
                     cur_class_prob = ind_cur_class_prob
-                elif self.assumption == 'neg_correlated':
+                elif self.assumption == 'neg_correlated': # 取的是sum
                     cur_class_prob = cor_cur_class_prob
                     cur_class_prob[cur_class_prob > 1] = ind_cur_class_prob[
                         cur_class_prob > 1]
-                elif self.assumption == 'hybrid':
+                elif self.assumption == 'hybrid': # max 和 ind 的平均
                     cur_class_prob = (cor_cur_class_prob.to_dense() +
                                       ind_cur_class_prob) / 2
                 else:
                     raise NotImplementedError
 
+            # 用Elementwise进行更新，直到收敛
             class_prob = torch.maximum(class_prob, cur_class_prob)
             cur_norm = class_prob.norm().item()
+            # 收敛判断
             if abs(cur_norm - max_norm) / max(max_norm, 1) < 1e-5:
                 logging.info(f'converged at {i} iter')
                 break
@@ -499,6 +548,7 @@ class SparseEGraph(BaseEGraph):
         # [BN, BM] @ [BM, 1] -> [BN, 1] -> [B, N]
         node_prob = spmm(probs_class2node_clone, class_prob.view(-1, 1))
         torch.cuda.empty_cache()
+        # class→node 的“采样概率”矩阵乘以每个 class 的激活概率，得到每个 node 的最终被选中概率。节点里的选中概率
         return node_prob.view(B, N), self.cyclic_loss.unsqueeze(0)
 
     # @profile
@@ -718,6 +768,10 @@ class SparseEGraph(BaseEGraph):
 
             if not root_classes.any():
                 break
+            # 记住这次的选择（可选，方便外部直接 model.last_visited_nodes）
+            self.last_visited_nodes = visited_nodes  # [B, N]
+            # 也把 class2node 存一下（如果你以后想导出“eclass→node”的映射）
+            self.last_class2node = class2node        # SparseTensor: (BN, BM)
 
         return visited_nodes
 
@@ -808,33 +862,41 @@ class SparseEGraph(BaseEGraph):
                              method='sparse_reduce_scc'):
         assert method in ['sparse_reduce', 'sparse_reduce_scc', 'dense']
 
+        # 分别是每个gpu负责的batch大小，classes数量，enodes数量
         B, M, N = self.batch_size // self.gpus, len(self.eclasses), len(
             self.enodes)
         if method == 'dense':
             dense_probs = probs_class2node.to_dense().reshape(B, M, N)
             dense_node2class = self.node2class.to_dense()
+            # 到这一步，得到 class -> class 的转移矩阵
             batched_c2c = dense_probs @ dense_node2class
             exp = torch.matrix_exp(batched_c2c)
             self.cyclic_loss = torch.einsum('bmm->b', exp).mean() - M
             print(f'cyclic loss = {self.cyclic_loss}')
             return
 
+        # c2n是一个稀疏张量形式，(row, col) <=> (B * nnz, col)
         values = probs_class2node.storage.value()
-        values = values.view(B, -1).mean(dim=0)
+        values = values.view(B, -1).mean(dim=0) # 这一步已经实现了batch维度的平均
         row = probs_class2node.storage.row()
         col = probs_class2node.storage.col()
-        nnz = row.numel() // B
+        nnz = row.numel() // B # length / B 恢复非零批次的个数
         device = values.device
 
         probs_class2node = torch.sparse_coo_tensor(
-            torch.stack([row[:nnz], col[:nnz]], dim=0), values, (N, M))
+            torch.stack([row[:nnz], col[:nnz]], #只拼接非零的元素
+            dim=0), values, 
+            (N, M) # 新矩阵的形状
+            )
         c2c = self.node2classT.to_torch_sparse_coo_tensor().to(
             device) @ probs_class2node
 
+        # 单GPU 稀疏矩阵指数映射 
         if method == 'sparse_reduce':
             assert self.gpus == 1
             self.cyclic_loss = (sparse_expm(c2c) - M)
             self.cyclic_loss = self.cyclic_loss.mean()
+
         elif method == 'sparse_reduce_scc':
             cyclic_loss = 0
             if not hasattr(self, 'edge_masks'):
@@ -852,14 +914,9 @@ class SparseEGraph(BaseEGraph):
                     else:
                         value = values[edge_mask]
 
-                    if degree == 2:
-                        # Reference: https://chatgpt.com/share/67e43b4c-b594-8012-bab7-b1c3a39a6f90
-                        expm = 2 * torch.cosh(value[0] * value[1]) - 2
-                    else:
-                        scc = torch.sparse_coo_tensor(reverse_index, value,
-                                                      (degree, degree))
-                        expm = sparse_expm(scc)
-
+                    scc = torch.sparse_coo_tensor(reverse_index, value,
+                                                  (degree, degree))
+                    expm = sparse_expm(scc)
                     if degree > 5000:
                         expm *= 1e-2
                     cyclic_loss += expm

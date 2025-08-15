@@ -223,6 +223,7 @@ class AdhocEGraph(BaseEGraph):
             eclass.included = False
             eclass.predecessor_embeddings = []
             eclass.predecessor_enodes = []
+            # 就是选中的class中的node被选中的概率归一化为1
             eclass.normalized_prob = 1
         for enode in self.enodes.values():
             enode.normalized_prob = 0
@@ -269,6 +270,7 @@ class AdhocEGraph(BaseEGraph):
 
         # initialize to_visit with all source eclasses
         for eclass_id in self.eclasses:
+            # 这个innode就是说的入度，也就是说所有的root class
             if len(self.eclasses[eclass_id].in_nodes) == 0:
                 to_visit.append(eclass_id)
                 self.eclasses[eclass_id].included = True
@@ -286,30 +288,39 @@ class AdhocEGraph(BaseEGraph):
 
             eclass = self.eclasses[eclass_id]
             # TODO: wrap the following in a function
+            # 得到node对应的隐向量
             enode_embedding = self.get_enode_embedding(eclass.enode_id)
+            # 得到pre node对应的上下文向量
             context_embedding = self.aggregate_eclass_context(eclass)
-            # use context embedding to update enode embedding
+            # activation和dropout得到更新后的node表示
             updated_embedding = self.dropout(
                 self.activation(self.dense(enode_embedding,
                                            context_embedding)))
+            # 未归一化的enode cost
             logits = self.projection(updated_embedding)
             logging.info(f'visiting eclass {eclass_id} with logits {logits}')
+            # 这里的softmax不明
             if self.training:
                 choice = F.gumbel_softmax(logits,
                                           tau=self.gumbel_tau,
                                           hard=True)
             else:
+                # 不训练就直接用argmax得到one-hot向量
                 choice = torch.eq(logits, logits.max()).float()
             selected[eclass_id] = choice
+            # 找到全局索引
             sg_choice = eclass.enode_id[choice.argmax()]
 
+            # 标记为已访问
             visited.add(eclass_id)
             for out_eclass in self.enodes[sg_choice].eclass_id:
                 self.eclasses[out_eclass].included = True
 
+                # 更新累计激活概率，但是硬编码是不变的
                 self.eclasses[out_eclass].normalized_prob *= choice.max()
 
                 # propagate with gumbel softmax signal
+                # embedding 加入下游的上下文信息
                 self.eclasses[out_eclass].predecessor_embeddings.append(
                     choice.matmul(updated_embedding))
 
@@ -317,6 +328,7 @@ class AdhocEGraph(BaseEGraph):
                 # self.eclasses[out_eclass].predecessor_embeddings.append(
                 #     updated_embedding[choice.argmax()])
 
+            # BFS，但是下一层的node只有所有入度都被遍历完才能进入新的遍历队列
             for enode in eclass.enode_id:
                 for out_eclass in self.enodes[enode].eclass_id:
                     self.eclasses[out_eclass].add_visited_in_node(enode)
@@ -332,6 +344,7 @@ class AdhocEGraph(BaseEGraph):
                 candidate_eclasses = None
                 for eclass_id in self.eclasses:
                     if self.eclasses[eclass_id].included:
+                        # 在这里更新没有遍历到的node
                         unvisited_in_nodes = len(
                             self.eclasses[eclass_id].in_nodes) - len(
                                 self.eclasses[eclass_id].visited_in_nodes)
@@ -350,6 +363,7 @@ class AdhocEGraph(BaseEGraph):
         visited = set()
 
         # initialize to_visit with all source eclasses
+        # same to the former
         for eclass_id in self.eclasses:
             if len(self.eclasses[eclass_id].in_nodes) == 0:
                 to_visit.append(eclass_id)
@@ -392,14 +406,20 @@ class AdhocEGraph(BaseEGraph):
             #     eclass.normalized_prob = 1 - eclass.normalized_prob
             class_depth = 0
             class_prob = 1
+            # 有入度才需要继承父节点的信息
             if len(eclass.predecessor_enodes) != 0:
                 for enode in eclass.predecessor_enodes:
+                    # 计算所有前驱都没激活的概率
                     class_prob *= 1 - self.enodes[enode].normalized_prob
                     class_depth += self.enodes[enode].depth
+                # 更新成 1 - 所有前驱都趋势的情况， 1 - ∏(1 - p_i)，这样用来表示至少有一个前驱被选中的概率
                 class_prob = 1 - class_prob
+                # 深度的平均值，不知道目前深度作用是什么
                 class_depth /= len(eclass.predecessor_enodes)
+            #真正被选中的enode 
             sg_choice = eclass.enode_id[choice.argmax()]
 
+            # 防止重复访问
             visited.add(eclass_id)
 
             for i, enode in enumerate(eclass.enode_id):
@@ -409,14 +429,15 @@ class AdhocEGraph(BaseEGraph):
                 else:
                     raise ValueError
                 for out_eclass in self.enodes[enode].eclass_id:
+                    # 加入遍历队列
                     self.eclasses[out_eclass].included = True
-
+                    # 加入前驱节点
                     self.eclasses[out_eclass].predecessor_enodes.append(enode)
-
+                    # 把上下文信息均加入predecessor
                     # propagate with gumbel softmax signal
                     self.eclasses[out_eclass].predecessor_embeddings.append(
                         choice.matmul(updated_embedding))
-
+            # 后面逻辑是完全相同的
             for enode in eclass.enode_id:
                 for out_eclass in self.enodes[enode].eclass_id:
                     self.eclasses[out_eclass].add_visited_in_node(enode)
@@ -449,21 +470,28 @@ class AdhocEGraph(BaseEGraph):
         # use forward to compute loss
         cost = 0
         cost_per_node = self.cost_per_node
+        # 如果是硬采样，也就是传统的{0,1}
         if not self.soft:
             for eclass_id in selected:
                 enode_id = self.eclasses[eclass_id].enode_id
                 enode_weight = cost_per_node[enode_id]
+                # 硬采样中，一个类里面只能选中一个，选中的概率是1
+                # chain在这里的作用是方便和后面soft_sample的逻辑统一,
                 chain = self.eclasses[eclass_id].normalized_prob
                 assert chain == 1 or chain.item() == 1
+                # 先乘再求和，Σ node * cost_of_node 
                 cost += chain * torch.matmul(selected[eclass_id], enode_weight)
         else:
             for enode in self.enodes:
                 enode_weight = cost_per_node[enode]
                 if optim_goal == 'depth':
                     enode_weight = self.p_number**self.enodes[enode].depth
+                # 这里也是用的的归一化概率
                 cost += enode_weight * self.enodes[enode].normalized_prob
         loss = cost
         if backward:
+            # 反向传播
             loss.backward()
+        # 张量变成float?标量，释放内存，便于logging
         loss = loss.item()
         return cost

@@ -35,6 +35,13 @@ def load_hp(dataset):
             'assumption': 'independent',
             'reg': 1e-2
         }
+    elif dataset == 'data_from_nncase':
+        hp = {
+            'optimizer': 'rmsprop',
+            'lr': 1e-2,
+            'assumption': 'independent',
+            'reg': 1e-2
+        }
     elif dataset == 'tensat':
         hp = {
             'optimizer': 'rmsprop',
@@ -127,11 +134,14 @@ def launch(path, dataset, args, exp_id):
                     train_args.quad_cost = cost_file
 
             train_args.input_file = os.path.join(path, file)
+            # 这个应该是调用的关键行
             log = call_command(train_args)
 
+            # 这里貌似利用了已有的log，应该是hard_sample的结果作为收敛测试
             if log is None:
                 min_loss = None
                 time = None
+            # 根本没进这个分支
             else:
                 min_loss = min(log['inference_loss'])
                 min_iter = np.argmin(log['inference_loss'])
@@ -158,6 +168,7 @@ def launch(path, dataset, args, exp_id):
             command += ' --verbose '
             with open(f'logs/{dataset}_{file}_cplex_oracle.log', 'w') as f:
                 sp.run(command, shell=True, stdout=f, stdin=f)
+    # 这是有关文件输出的
     if args.method == 'smoothe':
         file_name = f'{dataset}_{args.cost}_{exp_id}'
         if not args.greedy_init:
@@ -171,6 +182,7 @@ if __name__ == "__main__":
     args = get_args()
 
     for i in range(args.repeat):
+        # 这里realistic指的就是前面提到的五个数据集的通称，另一个是合成数据集，也就是人工生成的数据
         if args.dataset in ['realistic', 'synthetic', 'all']:
             if args.dataset == 'realistic':
                 all_dataset = [
@@ -187,6 +199,7 @@ if __name__ == "__main__":
                 path = os.path.join('./dataset/', dataset)
                 launch(path, dataset, args, i)
 
+        # 这个就是选择单一数据集进行训练
         else:
             path = os.path.join('./dataset/', args.dataset)
             launch(path, args.dataset, args, i)
