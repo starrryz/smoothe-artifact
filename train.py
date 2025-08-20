@@ -295,7 +295,13 @@ def run(args):
             cur_egraph.dump_selection(visited, out_path, batch=best_b, meta=meta)  # ← 仍传 bool
             logging.info(f"selection dumped to {out_path}")
     except Exception as ex:
-        logging.warning(f"dump_selection failed: {ex}")
+         # 失败也尽量 dump 当前 batch=0 的 selection（若还没拿到 visited，可跳过）debug打印更多信息
+        try:
+            if 'visited' in locals():
+                cur_egraph.dump_selection(visited, out_path.replace('.json','_failed.json'))
+        except Exception:
+            pass
+        raise  # 交给上层打印 traceback
 
     training_log['time'].append(time.time() - start_time)
     training_log['loss'].append(loss.item())

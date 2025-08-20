@@ -106,6 +106,9 @@ def launch(path, dataset, args, exp_id):
         train_args.batch_size = args.batch_size
         train_args.greedy_ini = args.greedy_init
         train_args.random_seed = exp_id
+        # 默认debug
+        train_args.debug = True
+        train_args.verbose = True
 
         train_args.optimizer = hp['optimizer']
         train_args.assumption = hp['assumption']

@@ -50,7 +50,9 @@ def call_command(args):
         # print(f"Caught ValueError: {str(ve)}")
         return None
     except Exception as ex:
-        print(f"Caught an unexpected exception: {str(ex)}")
+        # debug增加报错信息
+        print(f"Caught an unexpected exception: {repr(ex)}", flush=True)
+        traceback.print_exc()  # ← 这行会把具体报错文件/行号打出来
         return None
     return log
 

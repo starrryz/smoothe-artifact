@@ -644,6 +644,7 @@ class SparseEGraph(BaseEGraph):
 
     def inference_sample(self, embedding):
 
+        # debug0_这里的修改是改用了bin_count采用新的分组策略，
         def update_inference_class2node(node_logits):
             # Switch to deterministic sample during inference using max
             logits_class2node = SparseTensor(row=self.index0,
@@ -715,6 +716,7 @@ class SparseEGraph(BaseEGraph):
                                                  sparse_sizes=(B * N, B * M))
             self.batch_class2nodeT = self.batch_class2node.t()
 
+# debug0 jiancha
         while True:
             visited_classes |= root_classes
             # [BN, BM] @ [B, M] -> [BN, BM] @ [BM, 1] -> [BN, 1] -> [B, N]

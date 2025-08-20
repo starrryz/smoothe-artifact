@@ -110,37 +110,100 @@ class BaseEGraph(nn.Module, EGraphData):
         for eclass_id in self.eclasses:
             self.class_adj[eclass_id, self.eclasses[eclass_id].enode_id] = 1
 
+    from torch_sparse import SparseTensor
+    # 主要改变了不识别的dtype
     def set_to_matrix(self):
-        # set the class2node and node2class in a sparse COO format
-        n2c_row_index = []
-        n2c_col_index = []
-        for enode_id in self.enodes:
-            eclass_id = [i for i in self.enodes[enode_id].eclass_id]
-            n2c_row_index += [enode_id] * len(eclass_id)
-            n2c_col_index += eclass_id
-        n2c_row_index = torch.tensor(n2c_row_index).to(self.device)
-        n2c_col_index = torch.tensor(n2c_col_index).to(self.device)
-        self.node2class = SparseTensor(row=n2c_row_index,
-                                       col=n2c_col_index,
-                                       value=torch.ones(len(n2c_row_index),
-                                                        device=self.device),
-                                       sparse_sizes=(len(self.enodes),
-                                                     len(self.eclasses)))
+        import torch
+        device = self.device
+        print("[CHECK] enter set_to_matrix file=", __file__, flush=True)
 
-        c2n_row_index = []
-        c2n_col_index = []
-        for eclass_id in self.eclasses:
-            enode_id = self.eclasses[eclass_id].enode_id
-            c2n_row_index += [eclass_id] * len(enode_id)
-            c2n_col_index += enode_id
-        c2n_row_index = torch.tensor(c2n_row_index).to(self.device)
-        c2n_col_index = torch.tensor(c2n_col_index).to(self.device)
-        self.class2node = SparseTensor(row=c2n_row_index,
-                                       col=c2n_col_index,
-                                       value=torch.ones(len(c2n_row_index),
-                                                        device=self.device),
-                                       sparse_sizes=(len(self.eclasses),
-                                                     len(self.enodes)))
+        # —— 1) 固定顺序 & 连续映射（防止形状/对齐问题） ——
+        enode_ids  = list(self.enodes.keys())
+        eclass_ids = list(self.eclasses.keys())
+        # 如你的 key 是 "129.0" 这种字符串，也能被 as_tensor+long 吃掉，这里不强行排序
+        N, M = len(enode_ids), len(eclass_ids)
+
+        node_old2new = {nid: i for i, nid in enumerate(enode_ids)}
+        cls_old2new  = {cid: j for j, cid in enumerate(eclass_ids)}
+
+        # —— 2A) node→class（孩子一对多：训练/传播用） ——
+        rows_many, cols_many = [], []
+        for nid in enode_ids:
+            row = node_old2new[nid]
+            cids = getattr(self.enodes[nid], "eclass_id", [])
+            # 兼容 int / list
+            if isinstance(cids, (int, float, str)):
+                cids = [cids]
+            for cid in cids:
+                # 某些数据里是 "12.0" / numpy 标量：统一转为 int 再映射
+                try:
+                    j = cls_old2new.get(cid)
+                    if j is None:
+                        j = cls_old2new.get(int(cid))
+                    if j is None:
+                        j = cls_old2new.get(int(float(cid)))
+                except Exception:
+                    j = cls_old2new.get(cid)
+                if j is not None:
+                    rows_many.append(row)
+                    cols_many.append(j)
+
+        if len(rows_many) == 0:
+            row_many = torch.empty(0, dtype=torch.long, device=device)
+            col_many = torch.empty(0, dtype=torch.long, device=device)
+            val_many = torch.empty(0, dtype=torch.float32, device=device)
+        else:
+            row_many = torch.as_tensor(rows_many, dtype=torch.long, device=device)
+            col_many = torch.as_tensor(cols_many, dtype=torch.long, device=device)
+            val_many = torch.ones(row_many.numel(), dtype=torch.float32, device=device)
+
+        node2class = SparseTensor(row=row_many,
+                                col=col_many,
+                                value=val_many,
+                                sparse_sizes=(N, M)).coalesce()
+
+        # —— 2B) belong（节点隶属的一对一：set_index 用） ——
+        rows_belong, cols_belong = [], []
+        for nid in enode_ids:
+            row = node_old2new[nid]
+            belong = getattr(self.enodes[nid], "belong_eclass_id", None)
+            if belong is None:
+                continue
+            # 同样宽松解析为 int
+            j = None
+            try:
+                j = cls_old2new.get(belong)
+                if j is None:
+                    j = cls_old2new.get(int(belong))
+                if j is None:
+                    j = cls_old2new.get(int(float(belong)))
+            except Exception:
+                j = cls_old2new.get(belong)
+            if j is not None:
+                rows_belong.append(row)
+                cols_belong.append(j)
+
+        if len(rows_belong) == 0:
+            row_belong = torch.empty(0, dtype=torch.long, device=device)
+            col_belong = torch.empty(0, dtype=torch.long, device=device)
+            val_belong = torch.empty(0, dtype=torch.float32, device=device)
+        else:
+            row_belong = torch.as_tensor(rows_belong, dtype=torch.long, device=device)
+            col_belong = torch.as_tensor(cols_belong, dtype=torch.long, device=device)
+            val_belong = torch.ones(row_belong.numel(), dtype=torch.float32, device=device)
+
+        class2node = SparseTensor(row=col_belong,  # 转置
+                                col=row_belong,
+                                value=val_belong,
+                                sparse_sizes=(M, N)).coalesce()
+
+        # —— 3) 回写 ——
+        self.node2class = node2class
+        self.class2node = class2node
+        self.node2classT = node2class.t()
+
+        print("[CHECK] leave set_to_matrix", flush=True)
+
 
     def init_embedding(self):
         self.embedding = torch.rand(self.batch_size,

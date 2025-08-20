@@ -8,4 +8,5 @@ __pycache__/
 *.bin
 *.zip
 logs/
+dataset/data_from_nncase_case1/
 dataset/data_from_nncase/
