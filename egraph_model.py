@@ -120,6 +120,10 @@ class BaseEGraph(nn.Module, EGraphData):
         # —— 1) 固定顺序 & 连续映射（防止形状/对齐问题） ——
         enode_ids  = list(self.enodes.keys())
         eclass_ids = list(self.eclasses.keys())
+
+        print("[DEBUG] self.root_eclasses =", getattr(self, "root_eclasses", None), flush=True)
+        print("[DEBUG] self.eclasses keys =", list(self.eclasses.keys())[:10], flush=True)
+        print("[DEBUG] self.enodes keys =", list(self.enodes.keys())[:10], flush=True)
         # 如你的 key 是 "129.0" 这种字符串，也能被 as_tensor+long 吃掉，这里不强行排序
         N, M = len(enode_ids), len(eclass_ids)
 

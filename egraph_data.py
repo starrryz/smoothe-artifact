@@ -243,7 +243,7 @@ class EGraphData:
         self.raw_num_enodes = len(input_dict['nodes'])
         self.raw_num_eclasses = len(input_dict['classes'])
         self.raw_nodes_mapping = {k: [k] for k in input_dict['nodes']}
-        if self.drop_self_loops and len(input_dict['classes']) > 10:
+        if self.drop_self_loops and len(input_dict['classes']) > 2000:
             assert self.compress
             total_self_loops = 0
             total_merged = 0
@@ -324,6 +324,9 @@ class EGraphData:
         return self
 
     def from_json_file(self, json_file):
+
+        print(f"[JDBG] enter from_json_file: {json_file}", flush=True)
+
         with open(json_file, 'r') as f:
             input_dict = json.load(f)
         # the format from the extraction gym repo

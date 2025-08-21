@@ -35,13 +35,6 @@ def load_hp(dataset):
             'assumption': 'independent',
             'reg': 1e-2
         }
-    elif dataset == 'data_from_nncase':
-        hp = {
-            'optimizer': 'rmsprop',
-            'lr': 1e-2,
-            'assumption': 'independent',
-            'reg': 1e-2
-        }
     elif dataset == 'tensat':
         hp = {
             'optimizer': 'rmsprop',
