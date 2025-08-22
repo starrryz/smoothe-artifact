@@ -18,7 +18,7 @@ def get_args():
     parser.add_argument('--acyclic', action='store_true', default=False)
     parser.add_argument('--greedy_init', action='store_true', default=False)
     parser.add_argument('--dataset', type=str, default='box')
-    parser.add_argument('--batch_size', type=int, default=None)
+    parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--repeat', type=int, default=1)
     parser.add_argument('--cost',
                         type=str,

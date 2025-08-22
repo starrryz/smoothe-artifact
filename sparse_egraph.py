@@ -939,7 +939,7 @@ class SparseEGraph(BaseEGraph):
 
         # This paprameter should be problem specific
         # will change to input args later
-        penalty = 100
+        penalty = 10000
         raw_enodes = enodes @ self.nodes2raw
 
         # add quadratic cost if exists
@@ -958,7 +958,7 @@ class SparseEGraph(BaseEGraph):
                                                                  > 0).any():
                 cyclic_loss = cyclic_loss.mean()
                 if self.cyclic_count < 5:
-                    cyclic_coef = self.cyclic_count**2
+                    cyclic_coef = self.cyclic_count**2 + 200000
                 else:
                     cyclic_coef = 2**self.cyclic_count
                 cyclic_coef *= loss.abs().item() * self.reg
