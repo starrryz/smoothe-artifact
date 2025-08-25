@@ -243,7 +243,7 @@ class EGraphData:
         self.raw_num_enodes = len(input_dict['nodes'])
         self.raw_num_eclasses = len(input_dict['classes'])
         self.raw_nodes_mapping = {k: [k] for k in input_dict['nodes']}
-        if self.drop_self_loops and len(input_dict['classes']) > 2000:
+        if self.drop_self_loops and len(input_dict['classes']) > 10:
             assert self.compress
             total_self_loops = 0
             total_merged = 0
@@ -308,11 +308,24 @@ class EGraphData:
                            for i in eclass_id},
                 belong_eclass_id=node_to_class_id[enode_map[enode_id]],
                 label=label)
+
+            # if enode_id == "129.0":
+            #     nid = enode_map[enode_id]
+            #     logging.info(f"[DBG] ENode built: key={enode_id} -> nid(int)={nid}, children(int)={self.enodes[nid].eclass_id}")
+
+
             # if self.load_cost or self.label_cost:
             #     self.enode_cost[enode_map[enode_id]] = enode_cost[enode_id]
             for eclass in eclass_id:
                 self.eclasses[self.class_mapping[eclass]].add_in_node(
                     enode_map[enode_id])
+
+            # try:
+            #     rid = self.class_mapping[self.root[0]]
+            #     logging.info(f"[DBG] class_mapping: root '{self.root[0]}' -> {rid}")
+            # except Exception as e:
+            #     logging.info(f"[DBG] class_mapping root decode failed: {e}")
+
 
         for enode_id in self.raw_nodes_mapping.keys():
             self.enode_cost[enode_map[enode_id]] = enode_cost[enode_id]

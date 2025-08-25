@@ -2,6 +2,7 @@ from collections import defaultdict
 import logging
 from copy import deepcopy
 
+from typing import Optional
 import numpy as np
 import os
 import pickle
@@ -168,19 +169,45 @@ class SparseEGraph(BaseEGraph):
         self.set_index()
         self.known_cycles = []
     @torch.no_grad()
-    def decode_selected_keys(self, visited_nodes: torch.Tensor, batch: int = 0):
+    def decode_selected_keys(self,
+                            visited_nodes: torch.Tensor,
+                            batch: int = 0,
+                            space: str = 'raw'):
         """
-        visited_nodes: [B, N] 的 0/1（或 float）mask，来自 inference_sample 的返回
-        返回：该 batch 选中的 enode 的 key 列表，比如 ["5.0","3.0",...]
+        visited_nodes: [B, N_proc] 的 0/1（或 float）mask（inference_sample 返回）
+        space:
+        - 'processed' / 'proc' / 'compressed'：按压缩后的 N_proc 空间解码
+        - 'raw'（默认）：经 nodes2raw 投回原始 N_raw 空间后解码（包含被合并的单例类）
         """
-        mask = visited_nodes[batch].bool()
-        return self.node_to_id(mask)   # 你已有的映射工具，能把 mask → key 列表
+        space = space.lower()
+        if space in ('processed', 'proc', 'compressed'):
+            mask = visited_nodes[batch].bool()                 # [N_proc]
+            return self.node_to_id(mask)                       # -> ["129.0", ...]
+        elif space == 'raw':
+            # [B, N_proc] -> [B, N_raw]
+            visited_float = visited_nodes.to(
+                device=self.nodes2raw.device,
+                dtype=self.nodes2raw.dtype
+            )
+            raw_enodes = visited_float @ self.nodes2raw        # 稀疏乘法
+            raw_mask = (raw_enodes[batch] > 0)                 # [N_raw] 0/1
+            return self.node_to_id(raw_mask)                   # -> 原始 key 列表
+        else:
+            raise ValueError("space must be 'raw' or 'processed'")
 
     @torch.no_grad()
-    def dump_selection(self, visited_nodes: torch.Tensor, out_path: str, batch: int = 0, meta: Optional[dict] = None):
+    def dump_selection(self,
+                    visited_nodes: torch.Tensor,
+                    out_path: str,
+                    batch: int = 0,
+                    meta: Optional[dict] = None,
+                    space: str = 'raw'):
         payload = {
             "batch": int(batch),
-            "extract": self.decode_selected_keys(visited_nodes, batch),
+            # "space": space,
+            "extract": self.decode_selected_keys(visited_nodes, batch, space=space),
+            # 可选：也把压缩空间的选择一并导出，便于对比/排错
+            # "extract_processed": self.decode_selected_keys(visited_nodes, batch, space='processed'),
             "meta": (meta or {})
         }
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
@@ -668,8 +695,10 @@ class SparseEGraph(BaseEGraph):
         B, M, N = self.batch_size, len(self.eclasses), len(self.enodes)
         # root_classes = self.ordered_classes[0]
         root_classes = self.set_root()
+        # logging.info(f"[DBG] set_root: self.root(int)={torch.where(root_classes[0])[0].tolist()}, num_roots={root_classes.sum().item()}")
         # [M] -> [B, M]
         root_classes = root_classes.repeat(B, 1).bool()
+        # logging.info(f"[DBG] roots(int) = {torch.where(root_classes[0])[0].tolist()}") 
         visited_classes = torch.zeros(B,
                                       M,
                                       dtype=torch.bool,
@@ -684,6 +713,10 @@ class SparseEGraph(BaseEGraph):
         # [BM, BN]
         node_logits = node_logits.flatten()
         class2node, row_count = update_inference_class2node(node_logits)
+        # logging.info(f"[DBG] candidates_per_class: min={int(row_count.min())}, "
+        #              f"max={int(row_count.max())}, "
+        #              f"num_eq1={int((row_count==1).sum())}/{row_count.numel()} ")
+        # logging.info(f"[DBG] class2node nnz = {int(class2node.nnz())}")
         branch = (row_count > 1).view(B, -1)
 
         # Switch to random sample during inference
@@ -722,6 +755,30 @@ class SparseEGraph(BaseEGraph):
             # [BN, BM] @ [B, M] -> [BN, BM] @ [BM, 1] -> [BN, 1] -> [B, N]
             root_nodes = spmm(class2node, root_classes.float().reshape(-1, 1))
             root_nodes = root_nodes.view(B, -1)
+
+            # if 'dbg_first_iter_done' not in locals():
+            #     picked_idx = torch.where(root_nodes[0].view(-1).bool())[0].tolist()
+            #     try:
+            #         picked_keys = self.node_to_id(root_nodes[0].view(-1).bool())
+            #     except Exception:
+            #         picked_keys = []
+            #     logging.info(f"[DBG] picked@iter0 idx={picked_idx} keys={picked_keys[:10]}")
+
+            #     # 抽样最多打印前 5 个 node 的子类（验证 node→class 出边）
+            #     for n in picked_idx[:5]:
+            #         try:
+            #             children = list(self.enodes[n].eclass_id)
+            #         except Exception:
+            #             children = []
+            #         logging.info(f"[DBG] node {n} -> child eclasses (int) = {children}")
+
+            #     # 看看通过 node2classT 推出的下一层类
+            #     next_cls = spmm(self.node2classT, root_nodes.T).T[0].bool()
+            #     logging.info(f"[DBG] next classes(int) = {torch.where(next_cls)[0].tolist()}")
+            #     inter = (next_cls & visited_classes[0]).sum().item()
+            #     logging.info(f"[DBG] visited∧next = {inter}")
+            #     dbg_first_iter_done = True  # 只在首轮打印，避免刷屏
+
             visited_nodes |= root_nodes.bool()
 
             branch_eclasses = branch & root_classes

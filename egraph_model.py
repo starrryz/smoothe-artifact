@@ -206,6 +206,17 @@ class BaseEGraph(nn.Module, EGraphData):
         self.class2node = class2node
         self.node2classT = node2class.t()
 
+
+        # print(f"[DBG] node2class nnz={self.node2class.nnz()}", flush=True)
+        # print(f"[DBG] class2node nnz={self.class2node.nnz()}", flush=True)
+        # # 若已知 129.0 -> nid
+        # nid = node_old2new.get("129.0", None)
+        # if nid is not None:
+        #     # 取该行的切片（node→class）
+        #     row, col, val = self.node2class.coo()
+        #     cols = col[row == nid].tolist()
+        #     print(f"[DBG] node2class row for nid={nid} (key='129.0'): target classes={cols}", flush=True)
+
         print("[CHECK] leave set_to_matrix", flush=True)
 
 
