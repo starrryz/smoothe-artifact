@@ -275,9 +275,10 @@ def run(args):
         with torch.no_grad():
             # 1) 做一次离散推理，拿到 [B, N] 的选中 mask
             visited = cur_egraph.inference_sample(cur_egraph.embedding)
-            # # 紧跟在 visited = cur_egraph.inference_sample(cur_egraph.embedding) 之后
-            # keys_b0 = cur_egraph.decode_selected_keys(visited, batch=0)
-            # logging.info(f"[DBG] selected keys (batch=0): {keys_b0[:20]}")
+
+            # 紧跟在 visited = cur_egraph.inference_sample(cur_egraph.embedding) 之后
+            keys_b0 = cur_egraph.decode_selected_keys(visited, batch=0, space='raw')
+            logging.info(f"[DBG] selected keys (batch=0): {keys_b0[:20]}")
 
             # 2) 计算每个 batch 的线性代价，取最优批
             visited_float = visited.to(device=cur_egraph.nodes2raw.device, dtype=cur_egraph.nodes2raw.dtype)  # ←★ 关键

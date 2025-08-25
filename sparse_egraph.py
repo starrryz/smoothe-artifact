@@ -205,7 +205,7 @@ class SparseEGraph(BaseEGraph):
         payload = {
             "batch": int(batch),
             # "space": space,
-            "extract": self.decode_selected_keys(visited_nodes, batch, space=space),
+            "extract": self.decode_selected_keys(visited_nodes, batch, space='raw'),
             # 可选：也把压缩空间的选择一并导出，便于对比/排错
             # "extract_processed": self.decode_selected_keys(visited_nodes, batch, space='processed'),
             "meta": (meta or {})
