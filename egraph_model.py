@@ -74,6 +74,7 @@ class BaseEGraph(nn.Module, EGraphData):
         self.input_file = input_file
         self.share_proj = share_proj
 
+        # BSC batch_size夹在 1 - 512 之间，但是现在已经采取了固定值64，猜测是这里的问题，打算看一下
         if batch_size is None:
             # self.batch_size = 100_000_000 / len(self.eclasses)**2
             # print(f'eclass size: {len(self.eclasses)}')

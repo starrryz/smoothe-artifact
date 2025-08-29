@@ -2,6 +2,7 @@ import logging
 import random
 import argparse
 import torch
+torch.cuda.set_device(1)
 from collections import defaultdict
 from tqdm import tqdm
 import os
@@ -29,7 +30,8 @@ def get_args(default=False):
                         type=str,
                         default='examples/cunxi_test_egraph2.dot')
     parser.add_argument('--num_steps', type=int, default=100)
-    parser.add_argument('--patience', type=int, default=20)
+    # patience is related to early-stop，默认居然是20次，改成10次看看会不会早停
+    parser.add_argument('--patience', type=int, default=10)
     parser.add_argument('--time_limit', type=int, default=1200)
     parser.add_argument('--random_seed', type=int, default=44)
     parser.add_argument('--batch_size', type=int, default=None)
@@ -105,6 +107,7 @@ class EarlyStopper:
         self.min_delta = min_delta
 
     def __call__(self, loss):
+        # loss的变化连续patience次＜min_delta，就提前停止
         if self.best_loss - loss > self.min_delta:
             self.best_loss = loss
             self.count = 0
@@ -201,6 +204,7 @@ def run(args):
         optimizer, T_max=args.num_steps)
 
     training_log = defaultdict(list)
+    # maybe cost per node parameter containing
     logging.info(f'cost per node {egraph.cost_per_node}')
     # 不再下降就提前结束训练
     early_stop = EarlyStopper(patience=args.patience)
@@ -253,11 +257,12 @@ def run(args):
         training_log['loss'].append(loss.item())
         training_log['time'].append(time.time() - start_time)
 
-        # 达到时间上限，或者early_stop，就停止
+        # 1200s就是超时 inf_loss指的是inference_loss而不是infinite_loss
         if time.time() - start_time > args.time_limit:
             logging.info('time limit reached')
             break
-        if step > 1 and inf_loss < 1e4:
+        # 放大尝试早停的开始阈值，直接删掉阈值得了
+        if step > 1:
             if early_stop(inf_loss):
                 break
 
@@ -276,7 +281,7 @@ def run(args):
             # 1) 做一次离散推理，拿到 [B, N] 的选中 mask
             visited = cur_egraph.inference_sample(cur_egraph.embedding)
 
-            # 紧跟在 visited = cur_egraph.inference_sample(cur_egraph.embedding) 之后
+            # node selected 这里是输出包含单例类的所有选择带的结点
             keys_b0 = cur_egraph.decode_selected_keys(visited, batch=0, space='raw')
             logging.info(f"[DBG] selected keys (batch=0): {keys_b0[:20]}")
 

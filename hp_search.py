@@ -3,9 +3,46 @@ import argparse
 import os
 import torch
 import traceback
+import sys, time
 import numpy as np
 from train import run
 from train import get_args as get_train_args
+
+def _classify_runtime_error(e: RuntimeError) -> str:
+    s = str(e).lower()
+    if ("out of memory" in s) or ("cuda oom" in s) or ("cublas_status_alloc_failed" in s) or ("cudnn_status_alloc_failed" in s):
+        return "oom"
+    if ("illegal memory access" in s) or ("device-side assert" in s) or ("an illegal memory access" in s):
+        return "cuda_illegal"
+    if "cublas" in s:
+        return "cublas"
+    if "cudnn" in s:
+        return "cudnn"
+    if "nccl" in s or "peer access" in s:
+        return "nccl"
+    if "size mismatch" in s or "shape" in s or "mat1 and mat2 shapes" in s:
+        return "shape"
+    return "other"
+
+def _dump_cuda_state():
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            print("[CUDA] cuda.is_available() = False", flush=True)
+            return
+        dc = torch.cuda.device_count()
+        print(f"[CUDA] device_count={dc}, visible='{os.getenv('CUDA_VISIBLE_DEVICES')}'", flush=True)
+        for i in range(dc):
+            try:
+                name = torch.cuda.get_device_name(i)
+                alloc = torch.cuda.memory_allocated(i) // (1024**2)
+                reserv = torch.cuda.memory_reserved(i) // (1024**2)
+                maxalloc = torch.cuda.max_memory_allocated(i) // (1024**2)
+                print(f"[CUDA:{i}] {name} | alloc={alloc}MB reserved={reserv}MB max_alloc={maxalloc}MB", flush=True)
+            except Exception as ie:
+                print(f"[CUDA:{i}] <probe failed> {ie}", flush=True)
+    except Exception as ie:
+        print(f"[CUDA] state dump failed: {ie}", flush=True)
 
 def dump_args(ns, tag="ARGS"):
     try:
@@ -35,24 +72,61 @@ def call_command(args):
     dump_args(args, tag="call_command")
     try:
         log = run(args)
+
+    # BSC main error occurs
     except RuntimeError as e:
-        # print("Caught CUDA Error: Insufficient resources")
-        if args.batch_size is None:
-            args.batch_size = 64
-        elif args.batch_size > 1:
-            args.batch_size = args.batch_size // 2
-            # print(f"Halfing batch size to {args.batch_size}")
-        else:
-            return None
-        log = call_command(args)
-        args.batch_size = None
+        # 1) 打印异常信息（类型 + 完整堆栈）
+        etype = type(e).__name__
+        msg = str(e)
+        kind = _classify_runtime_error(e)
+        print("\n" + "="*80, flush=True)
+        print(f"[RuntimeError] kind={kind} type={etype}", flush=True)
+        print(f"[RuntimeError] message: {msg}", flush=True)
+        print(f"[RuntimeError] args: {getattr(e, 'args', None)}", flush=True)
+        print("-"*80, flush=True)
+        # 完整堆栈（包含 causes / context）
+        print("".join(traceback.format_exception(type(e), e, e.__traceback__)), flush=True)
+        print("-"*80, flush=True)
+
+        # 2) 打印运行时上下文（GPU/环境/关键参数）
+        print(f"[CTX] gpus={getattr(args, 'gpus', None)} "
+              f"batch_size={getattr(args, 'batch_size', None)} "
+              f"gpu_ids='{os.getenv('CUDA_VISIBLE_DEVICES')}'", flush=True)
+        _dump_cuda_state()
+        print("="*80 + "\n", flush=True)
+
+        # 3) 针对 OOM 的回退；非 OOM 不要盲目减 batch
+        if kind == "oom":
+            if args.batch_size is None:
+                args.batch_size = 64
+            elif args.batch_size > 1:
+                # 对半减，但至少为 1
+                args.batch_size = max(1, args.batch_size // 2)
+            else:
+                return None
+
+            # 若多卡，保证 batch_size 能被 gpus 整除（向下对齐；至少每卡1个）
+            if getattr(args, "gpus", 0) and args.gpus > 1:
+                snapped = (args.batch_size // args.gpus) * args.gpus
+                if snapped < args.gpus:
+                    # 实在太小了：改为每卡1个
+                    snapped = args.gpus
+                if snapped != args.batch_size:
+                    print(f"[BATCH] snap {args.batch_size} -> {snapped} for gpus={args.gpus}", flush=True)
+                    args.batch_size = snapped
+
+            # 递归重试（注意：不再把 args.batch_size 复位为 None）
+            return call_command(args)
+
+        # 4) 非 OOM：直接返回 None（或改为上抛），避免“误降 batch 导致归零”
+        return None
     except ValueError as ve:
         # print(f"Caught ValueError: {str(ve)}")
         return None
     except Exception as ex:
         # debug增加报错信息
         print(f"Caught an unexpected exception: {repr(ex)}", flush=True)
-        traceback.print_exc()  # ← 这行会把具体报错文件/行号打出来
+        print("".join(traceback.format_exception(type(ex), ex, ex.__traceback__)), flush=True)
         return None
     return log
 

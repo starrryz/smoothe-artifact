@@ -1,15 +1,17 @@
 from collections import defaultdict
 import logging
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 from copy import deepcopy
 
 from typing import Optional
 import numpy as np
-import os
+import os, time
 import pickle
 import networkx as nx
 import scipy
 from typing import Optional  # 也可加 Dict, Any 如果你想更严格
 import json
+# 这里引入了两套，除了原生pytorch还有torch_sparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,6 +29,24 @@ from tqdm import tqdm
 # from pytorch_memlab import LineProfiler, profile
 
 spmm = torch_sparse.matmul
+
+def _sync():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+class CudaTimer:
+    """带 GPU 同步的墙钟计时器；进入/退出都做 synchronize。"""
+    def __init__(self, name, bucket: dict):
+        self.name = name
+        self.bucket = bucket
+    def __enter__(self):
+        _sync()
+        self.t0 = time.perf_counter()
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        _sync()
+        dt = time.perf_counter() - self.t0
+        self.bucket[self.name] = self.bucket.get(self.name, 0.0) + dt
 
 # dim = 1指的是行，dim = 0指的是列
 def sparse_gumbel_softmax(src,
@@ -234,6 +254,7 @@ class SparseEGraph(BaseEGraph):
         self.index1 = nn.Parameter(self.batch_per_node * N +
                                    self.node_per_node,
                                    requires_grad=False)
+
     def find_cycles(self, batch_choose_enodes, cycle_info=False):
 
         def cycle_dfs(class_id):
@@ -424,159 +445,185 @@ class SparseEGraph(BaseEGraph):
         return sparse_C
 
     # @profile
-    def sample_v2(self, embedding, hard=False):
-        # 单GPU上的batch数，eclass的总数，enode的总数
-        B, M, N = self.batch_size // self.gpus, len(self.eclasses), len(
-            self.enodes)
-        eps = 1e-10
-        device = embedding.device
-        # 新建矩阵，存放enode对应的概率值
-        node_prob = torch.zeros((B, N), device=device, requires_grad=False)
-        # 把每个节点的隐向量映射成标量
-        node_logits = self.forward_embedding(embedding)  # [B, N]
+    def sample_v2(self, embedding, hard=False, profile=False):
 
-        # 每个 class 在该 batch 中对每个 node 的“软”采样概率
-        probs_class2node = sparse_gumbel_softmax(node_logits,
-                                                 row=self.index0[:B * N],
-                                                 col=self.index1[:B * N],
-                                                 shape=(B * N, B * M),
-                                                 dim=1,
-                                                 tau=self.gumbel_tau,
-                                                 hard=hard,
-                                                 return_format='torch_sparse')
+        profile = profile or os.getenv("SMOOTHE_PROFILE", "0") == "1"
+        prof = {}
 
-        probs_class2node_clone = probs_class2node.clone()
-        self.probs_class2node = probs_class2node
-        # 环路惩罚没看懂
-        if self.filter_cycles:
-            # reduce the batch dimension on the class dimension
-            reshaped_probs_class2node = probs_class2node.clone()
-            reshaped_probs_class2node.storage._col %= M
-            reshaped_probs_class2node.storage._sparse_sizes = (B * N, M)
+        _sync()
+        _wall_t0 = time.perf_counter()
 
-            self.compute_cyclic_loss2(reshaped_probs_class2node)
-        # 构造批量class -> node, node -> class COO 稀疏矩阵
-        row = probs_class2node.storage._row
-        col = probs_class2node.storage._col
-        values = probs_class2node.storage._value
-        probs_class2node = torch.sparse_coo_tensor(indices=torch.stack(
-            [col, row]),
-                                                   values=values,
-                                                   size=(B * M, B * N))
+        try:
+            B, M, N = self.batch_size // self.gpus, len(self.eclasses), len(
+                self.enodes)
+            eps = 1e-10
+            device = embedding.device
+            # 新建矩阵，存放enode对应的概率值
+            node_prob = torch.zeros((B, N), device=device, requires_grad=False)
+            # 把每个节点的隐向量映射成标量
+            node_logits = self.forward_embedding(embedding)  # [B, N]
 
-        # probs_class2node2 = torch.sparse_coo_tensor(indices=torch.stack(
-        #     [col, row % N]),
-        #                                             values=values,
-        #                                             size=(B * M, N))
+            # 每个 class 在该 batch 中对每个 node 的“软”采样概率
+            probs_class2node = sparse_gumbel_softmax(node_logits,
+                                                    row=self.index0[:B * N],
+                                                    col=self.index1[:B * N],
+                                                    shape=(B * N, B * M),
+                                                    dim=1,
+                                                    tau=self.gumbel_tau,
+                                                    hard=hard,
+                                                    return_format='torch_sparse')
 
-        # 拓展到批量维度
-        if not hasattr(self, 'batch_node2class'):
-            self.node2class = self.node2class.to(device)
-            row = self.node2class.storage._row
-            col = self.node2class.storage._col
-            value = self.node2class.storage._value
-            nnz = row.numel()
-            batch_index = torch.arange(B, device=device).repeat_interleave(nnz)
-            self.batch_node2class = torch.sparse_coo_tensor(
-                indices=torch.stack([
-                    row.repeat(B) + batch_index * N,
-                    col.repeat(B) + batch_index * M
-                ]),
-                values=value.repeat(B),
-                size=(B * N, B * M))
+            probs_class2node_clone = probs_class2node.clone()
+            self.probs_class2node = probs_class2node
+            # 环路惩罚,最耗时的一部分5.5s / 6s ~ 7s
+            if self.filter_cycles:
+                with CudaTimer("cycle_loss", prof):
+                    # reduce the batch dimension on the class dimension
+                    reshaped_probs_class2node = probs_class2node.clone()
+                    # 为什么要取余M
+                    reshaped_probs_class2node.storage._col %= M
+                    # 这一步是什么，更新维度吗
+                    reshaped_probs_class2node.storage._sparse_sizes = (B * N, M)
 
-        # [BM, BN] @ [BN, BM] -> [BM, BM]
-        # c2c = probs_class2node @ self.batch_node2class
-        # (class→node) × (node→class) → (class→class) 求得是class -> node -> class的联合概率 @ 是 矩阵乘 的意思
-        c2c = probs_class2node @ self.batch_node2class.to(device)
-        # torch.save(probs_class2node, 'c2n.pt')
-        # torch.save(self.batch_node2class.to(device), 'n2c.pt')
-        # breakpoint()
-        # c2c = self.forloop_spmm(probs_class2node, self.node_adj.float(), M, N, B)
-        # c2c = self.forloop_spgemm(probs_class2node, self.node2class, M, N, B)
+                    self.compute_cyclic_loss2(reshaped_probs_class2node)
+            # 构造批量class -> node, node -> class COO 稀疏矩阵
+            row = probs_class2node.storage._row
+            col = probs_class2node.storage._col
+            values = probs_class2node.storage._value
+            probs_class2node = torch.sparse_coo_tensor(indices=torch.stack(
+                [col, row]),
+                                                    values=values,
+                                                    size=(B * M, B * N))
 
-        # c2c = probs_class2node2 @ self.node2class.to_torch_sparse_coo_tensor()
-        indices = c2c.indices()
-        # indices[1] += indices[0] // M * M
-        # 迭代求class被激活的总概率，
-        class_prob = torch.zeros((B * M), device=device, requires_grad=False)
-        max_norm = 0
-        for i in range(M):
-            # 只激活源class
-            if i == 0:
-                cur_class_prob = self.set_root().float().to(device)
-                cur_class_prob = cur_class_prob.unsqueeze(0).expand(
-                    B, M).flatten()
-            # 任意已激活的class到新class
-            else:
-                # # [B, M] -> [BM, 1]
-                # class_prob = class_prob.flatten()
+            # probs_class2node2 = torch.sparse_coo_tensor(indices=torch.stack(
+            #     [col, row % N]),
+            #                                             values=values,
+            #                                             size=(B * M, N))
 
-                value = c2c.values()
-                value = value * class_prob[indices[0]]
+            # 拓展到批量维度
+            if not hasattr(self, 'batch_node2class'):
+                self.node2class = self.node2class.to(device)
+                row = self.node2class.storage._row
+                col = self.node2class.storage._col
+                value = self.node2class.storage._value
+                nnz = row.numel()
+                batch_index = torch.arange(B, device=device).repeat_interleave(nnz)
+                self.batch_node2class = torch.sparse_coo_tensor(
+                    indices=torch.stack([
+                        row.repeat(B) + batch_index * N,
+                        col.repeat(B) + batch_index * M
+                    ]),
+                    values=value.repeat(B),
+                    size=(B * N, B * M))
 
-                if self.assumption in ['correlated', 'hybrid']:
-                    # assume all eclasses are correlated
-                    cor_cur_class_prob = SparseTensor(row=indices[0],
-                                                      col=indices[1],
-                                                      value=value,
-                                                      sparse_sizes=(B * M,
-                                                                    B * M))
-                    cor_cur_class_prob = cor_cur_class_prob.max(dim=0)
+            # [BM, BN] @ [BN, BM] -> [BM, BM]
+            # c2c = probs_class2node @ self.batch_node2class
+            # (class→node) × (node→class) → (class→class) 求得是class -> node -> class的联合概率 @ 是 矩阵乘 的意思
+            c2c = probs_class2node @ self.batch_node2class.to(device)
+            # torch.save(probs_class2node, 'c2n.pt')
+            # torch.save(self.batch_node2class.to(device), 'n2c.pt')
+            # breakpoint()
+            # c2c = self.forloop_spmm(probs_class2node, self.node_adj.float(), M, N, B)
+            # c2c = self.forloop_spgemm(probs_class2node, self.node2class, M, N, B)
 
-                if self.assumption in [
-                        'independent', 'hybrid', 'neg_correlated'
-                ]:
-                    # assume all eclasses are independent
-                    value = torch.log((1 - value).clamp(eps, 1.0))
-                    ind_cur_class_prob = SparseTensor(row=indices[0],
-                                                      col=indices[1],
-                                                      value=value,
-                                                      sparse_sizes=(B * M,
-                                                                    B * M))
-                    ind_cur_class_prob = ind_cur_class_prob.sum(dim=0)
-                    ind_cur_class_prob = ind_cur_class_prob.to_dense()
-                    # 1−∏(1−p)，还是之前的，至少有一个父节点选中的概率
-                    ind_cur_class_prob = 1 - torch.exp(ind_cur_class_prob)
-
-                if self.assumption == 'neg_correlated':
-                    cor_cur_class_prob = SparseTensor(row=indices[0],
-                                                      col=indices[1],
-                                                      value=value,
-                                                      sparse_sizes=(B * M,
-                                                                    B * M))
-                    cor_cur_class_prob = cor_cur_class_prob.sum(dim=0)
-
-                if self.assumption == 'correlated': # 这个取得是max
-                    cur_class_prob = cor_cur_class_prob.to_dense()
-                elif self.assumption == 'independent': 
-                    cur_class_prob = ind_cur_class_prob
-                elif self.assumption == 'neg_correlated': # 取的是sum
-                    cur_class_prob = cor_cur_class_prob
-                    cur_class_prob[cur_class_prob > 1] = ind_cur_class_prob[
-                        cur_class_prob > 1]
-                elif self.assumption == 'hybrid': # max 和 ind 的平均
-                    cur_class_prob = (cor_cur_class_prob.to_dense() +
-                                      ind_cur_class_prob) / 2
+            # c2c = probs_class2node2 @ self.node2class.to_torch_sparse_coo_tensor()
+            indices = c2c.indices()
+            # indices[1] += indices[0] // M * M
+            # 迭代求class被激活的总概率，
+            class_prob = torch.zeros((B * M), device=device, requires_grad=False)
+            max_norm = 0
+            for i in range(M):
+                # 只激活源class
+                if i == 0:
+                    cur_class_prob = self.set_root().float().to(device)
+                    cur_class_prob = cur_class_prob.unsqueeze(0).expand(
+                        B, M).flatten()
+                # 任意已激活的class到新class
                 else:
-                    raise NotImplementedError
+                    # # [B, M] -> [BM, 1] 这里flatten为什么被注释掉了（原始版本就是注释掉的）
+                    # class_prob = class_prob.flatten()
 
-            # 用Elementwise进行更新，直到收敛
-            class_prob = torch.maximum(class_prob, cur_class_prob)
-            cur_norm = class_prob.norm().item()
-            # 收敛判断
-            if abs(cur_norm - max_norm) / max(max_norm, 1) < 1e-5:
-                logging.info(f'converged at {i} iter')
-                break
-            else:
-                max_norm = max(cur_norm, max_norm)
+                    value = c2c.values()
+                    value = value * class_prob[indices[0]]
 
-        # breakpoint()
-        # [BN, BM] @ [BM, 1] -> [BN, 1] -> [B, N]
-        node_prob = spmm(probs_class2node_clone, class_prob.view(-1, 1))
-        torch.cuda.empty_cache()
-        # class→node 的“采样概率”矩阵乘以每个 class 的激活概率，得到每个 node 的最终被选中概率。节点里的选中概率
-        return node_prob.view(B, N), self.cyclic_loss.unsqueeze(0)
+                    if self.assumption in ['correlated', 'hybrid']:
+                        # assume all eclasses are correlated
+                        cor_cur_class_prob = SparseTensor(row=indices[0],
+                                                        col=indices[1],
+                                                        value=value,
+                                                        sparse_sizes=(B * M,
+                                                                        B * M))
+                        cor_cur_class_prob = cor_cur_class_prob.max(dim=0)
+
+                    if self.assumption in [
+                            'independent', 'hybrid', 'neg_correlated'
+                    ]:
+                        # assume all eclasses are independent
+                        value = torch.log((1 - value).clamp(eps, 1.0))
+                        ind_cur_class_prob = SparseTensor(row=indices[0],
+                                                        col=indices[1],
+                                                        value=value,
+                                                        sparse_sizes=(B * M,
+                                                                        B * M))
+                        ind_cur_class_prob = ind_cur_class_prob.sum(dim=0)
+                        ind_cur_class_prob = ind_cur_class_prob.to_dense()
+                        # 1−∏(1−p)，还是之前的，至少有一个父节点选中的概率
+                        ind_cur_class_prob = 1 - torch.exp(ind_cur_class_prob)
+
+                    if self.assumption == 'neg_correlated':
+                        cor_cur_class_prob = SparseTensor(row=indices[0],
+                                                        col=indices[1],
+                                                        value=value,
+                                                        sparse_sizes=(B * M,
+                                                                        B * M))
+                        cor_cur_class_prob = cor_cur_class_prob.sum(dim=0)
+
+                    if self.assumption == 'correlated': # 这个取得是max
+                        cur_class_prob = cor_cur_class_prob.to_dense()
+                    elif self.assumption == 'independent': 
+                        cur_class_prob = ind_cur_class_prob
+                    elif self.assumption == 'neg_correlated': # 取的是sum
+                        cur_class_prob = cor_cur_class_prob
+                        cur_class_prob[cur_class_prob > 1] = ind_cur_class_prob[
+                            cur_class_prob > 1]
+                    elif self.assumption == 'hybrid': # max 和 ind 的平均
+                        cur_class_prob = (cor_cur_class_prob.to_dense() +
+                                        ind_cur_class_prob) / 2
+                    else:
+                        raise NotImplementedError
+
+                # 用Elementwise进行更新，直到收敛
+                # BSC 可能和早停有关
+                class_prob = torch.maximum(class_prob, cur_class_prob)
+                cur_norm = class_prob.norm().item()
+                # 收敛判断
+                if abs(cur_norm - max_norm) / max(max_norm, 1) < 1e-5:
+                    logging.info(f'converged at {i} iter')
+                    break
+                else:
+                    max_norm = max(cur_norm, max_norm)
+
+            # breakpoint()
+            # [BN, BM] @ [BM, 1] -> [BN, 1] -> [B, N]
+            node_prob = spmm(probs_class2node_clone, class_prob.view(-1, 1))
+            torch.cuda.empty_cache()
+            if profile:
+                total = sum(prof.values())
+                logging.info("[profile] sample_v2 total=%.3fs | %s",
+                            total, ", ".join(f"{k}={v:.3f}s" for k, v in sorted(prof.items())))
+            # class→node 的“采样概率”矩阵乘以每个 class 的激活概率，得到每个 node 的最终被选中概率。节点里的选中概率
+            return node_prob.view(B, N), self.cyclic_loss.unsqueeze(0)
+
+        finally:
+            # —— 退出前同步，记录真实墙钟 ——
+            _sync()
+            _wall_dt = time.perf_counter() - _wall_t0
+            if profile:
+                _sum_dt = sum(prof.values())
+                logging.info(
+                    "[profile] sample_v2 WALL=%.3fs (sum buckets=%.3fs, overhead=%.3fs)",
+                    _wall_dt, _sum_dt, _wall_dt - _sum_dt
+                )
 
     # @profile
     def sample(self, embedding, hard=False):
@@ -995,7 +1042,7 @@ class SparseEGraph(BaseEGraph):
         assert optim_goal == 'sum'
 
         # This paprameter should be problem specific
-        # will change to input args later
+        # will change to input args later 10000 / 200000
         penalty = 10000
         raw_enodes = enodes @ self.nodes2raw
 
@@ -1047,6 +1094,7 @@ class SparseEGraph(BaseEGraph):
             loss = loss.min()
             if verbose:
                 # logging.info(
+                # node selected 这里还是选择的删去单例类之后的选择
                 print(f'selected {self.node_to_id(enodes[best_batch].bool())}')
         return loss
 

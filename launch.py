@@ -14,11 +14,12 @@ def get_args():
                         type=str,
                         default='cbc',
                         choices=['cbc', 'scip', 'cplex', 'smoothe'])
-    parser.add_argument('--steps', type=int, default=300)
+    # reduce the iter steps
+    parser.add_argument('--steps', type=int, default=150)
     parser.add_argument('--acyclic', action='store_true', default=False)
     parser.add_argument('--greedy_init', action='store_true', default=False)
     parser.add_argument('--dataset', type=str, default='box')
-    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--repeat', type=int, default=1)
     parser.add_argument('--cost',
                         type=str,
@@ -82,7 +83,7 @@ def load_hp(dataset):
         hp = {
             'optimizer': 'rmsprop',
             'lr': 1e-2,
-            'assumption': 'hybrid',
+            'assumption': 'independent',
             'reg': 1e-2
         }
     return hp
@@ -99,7 +100,7 @@ def launch(path, dataset, args, exp_id):
         train_args.batch_size = args.batch_size
         train_args.greedy_ini = args.greedy_init
         train_args.random_seed = exp_id
-        # 默认debug
+        # 默认debug，这是新加的
         train_args.debug = True
         train_args.verbose = True
 
